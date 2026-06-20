@@ -1,6 +1,9 @@
 package com.swiggyx.service;
 
+import com.swiggyx.model.Inventory;
+import com.swiggyx.model.InventoryId;
 import com.swiggyx.model.Order;
+import com.swiggyx.repository.InventoryRepository;
 import com.swiggyx.repository.OrderRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -21,6 +24,8 @@ public class OrderService {
     // Spring injects the OrderRepository automatically
     @Autowired
     private OrderRepository orderRepository;
+    @Autowired
+    private InventoryRepository inventoryRepository;
     // Spring injects ioThreadPool from ThreadPoolConfig
     @Autowired
     @Qualifier("ioThreadPool")
@@ -30,12 +35,11 @@ public class OrderService {
     @Qualifier("cpuThreadPool")
     private ExecutorService cpuThreadPool;
     // Spring injects dbSemaphore from ThreadPoolConfig
-    @Autowired
-    @Qualifier("dbSemaphore")
+
     private Semaphore dbSemaphore;
     // Shared inventory — race condition risk
     // multiple threads can read/write simultaneously
-    private int inventory = 10;
+
 
     // Step 1 — Validate order
     // Fast CPU work — no IO, no locks needed
@@ -93,22 +97,32 @@ public class OrderService {
     // Step 3 — Check and Deduct Inventory
     // CRITICAL SECTION — race condition protection
     // Two users cannot order last item simultaneously
-    private boolean checkAndDeductInventory(String userId, int quantity) {
+    private boolean checkAndDeductInventory(String userId,
+                                            String restaurantId,
+                                            String itemName,
+                                            int quantity) {
         inventoryLock.lock();
         try {
+            InventoryId invId = new InventoryId(restaurantId, itemName);
+
+            Inventory inv = inventoryRepository.findById(invId)
+                    .orElseThrow(() -> new RuntimeException(
+                            "Inventory not found for: " + restaurantId + ", " + itemName));
+
             System.out.println("Inventory check for: " + userId
-                    + " | Current inventory: " + inventory
+                    + " | Current: " + inv.getCount()
                     + " | Thread: " + Thread.currentThread().getName());
 
-            if (inventory < quantity) {
+            if (inv.getCount() < quantity) {
                 System.out.println("Insufficient inventory for: " + userId);
                 return false;
             }
 
-            // Deduct inventory
-            inventory = inventory - quantity;
+            inv.setCount(inv.getCount() - quantity);
+            inventoryRepository.save(inv);
+
             System.out.println("Inventory deducted for: " + userId
-                    + " | Remaining: " + inventory);
+                    + " | Remaining: " + inv.getCount());
             return true;
 
         } finally {
@@ -123,38 +137,25 @@ public class OrderService {
                                 String itemName,
                                 int quantity,
                                 double amount) {
-        try {
-            // Acquire semaphore — blocks if 20 threads already in DB
-            dbSemaphore.acquire();
-            System.out.println("DB connection acquired for: " + userId
-                    + " | Thread: " + Thread.currentThread().getName());
 
-            // Build order object
-            Order order = Order.builder()
-                    .userId(userId)
-                    .restaurantId(restaurantId)
-                    .itemName(itemName)
-                    .quantity(quantity)
-                    .totalAmount(amount)
-                    .status("PLACED")
-                    .createdAt(LocalDateTime.now())
-                    .build();
+        System.out.println("Saving order to DB for: " + userId
+                + " | Thread: " + Thread.currentThread().getName());
 
-            // Save to DB — JPA handles SQL
-            Order savedOrder = orderRepository.save(order);
-            System.out.println("Order saved to DB: " + savedOrder.getId()
-                    + " for: " + userId);
+        Order order = Order.builder()
+                .userId(userId)
+                .restaurantId(restaurantId)
+                .itemName(itemName)
+                .quantity(quantity)
+                .totalAmount(amount)
+                .status("PLACED")
+                .createdAt(LocalDateTime.now())
+                .build();
 
-            return savedOrder;
+        Order savedOrder = orderRepository.save(order);
+        System.out.println("Order saved: " + savedOrder.getId()
+                + " for: " + userId);
 
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while waiting for DB connection");
-        } finally {
-            // ALWAYS release semaphore — even if exception thrown
-            dbSemaphore.release();
-            System.out.println("DB connection released for: " + userId);
-        }
+        return savedOrder;
     }
 
     // Main method — connects all steps together
@@ -182,7 +183,7 @@ public class OrderService {
             // Step 3 — Check and deduct inventory
             // Lock ordering: inventoryLock acquired here (FIRST)
             boolean inventoryAvailable =
-                    checkAndDeductInventory(userId, quantity);
+                    checkAndDeductInventory(userId, restaurantId, itemName, quantity);
 
             if (!inventoryAvailable) {
                 return "FAILED: Item not available";
@@ -194,12 +195,16 @@ public class OrderService {
             try {
                 boolean isFraud = fraudFuture.get();
                 if (isFraud) {
-                    // Restore inventory — order blocked
                     inventoryLock.lock();
                     try {
-                        inventory = inventory + quantity;
-                        System.out.println("Inventory restored for: "
-                                + userId + " fraud detected");
+                        InventoryId invId = new InventoryId(restaurantId, itemName);
+                        Inventory inv = inventoryRepository.findById(invId)
+                                .orElseThrow(() -> new RuntimeException("Inventory not found"));
+
+                        inv.setCount(inv.getCount() + quantity);
+                        inventoryRepository.save(inv);
+
+                        System.out.println("Inventory restored — fraud: " + userId);
                     } finally {
                         inventoryLock.unlock();
                     }

@@ -5,7 +5,6 @@ import org.springframework.context.annotation.Configuration;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
 
 @Configuration
 public class ThreadPoolConfig {
@@ -32,10 +31,4 @@ public class ThreadPoolConfig {
         return Executors.newFixedThreadPool(CPU_CORES);
     }
 
-    // DB Connection Semaphore — max 20 simultaneous DB connections
-    @Bean(name = "dbSemaphore")
-    public Semaphore dbSemaphore() {
-        System.out.println("Creating DB Semaphore with 20 permits");
-        return new Semaphore(20);
-    }
 }
