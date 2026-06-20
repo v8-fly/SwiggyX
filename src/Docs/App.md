@@ -538,7 +538,6 @@ package com.swiggyx.model;
 
 import jakarta.persistence.*;
 import lombok.*;
-
 import java.time.LocalDateTime;
 
 @Entity
@@ -685,7 +684,6 @@ package com.swiggyx.repository;
 import com.swiggyx.model.Order;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
-
 import java.util.List;
 
 @Repository
@@ -775,7 +773,6 @@ package com.swiggyx.config;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -785,14 +782,14 @@ public class ThreadPoolConfig {
 
     // Number of CPU cores on this machine
     private static final int CPU_CORES =
-            Runtime.getRuntime().availableProcessors();
+        Runtime.getRuntime().availableProcessors();
 
     // IO Thread Pool — cores × 2
     // threads mostly waiting for IO, can have more than cores
     @Bean(name = "ioThreadPool")
     public ExecutorService ioThreadPool() {
         System.out.println("Creating IO Thread Pool with "
-                + (CPU_CORES * 2) + " threads");
+            + (CPU_CORES * 2) + " threads");
         return Executors.newFixedThreadPool(CPU_CORES * 2);
     }
 
@@ -801,7 +798,7 @@ public class ThreadPoolConfig {
     @Bean(name = "cpuThreadPool")
     public ExecutorService cpuThreadPool() {
         System.out.println("Creating CPU Thread Pool with "
-                + CPU_CORES + " threads");
+            + CPU_CORES + " threads");
         return Executors.newFixedThreadPool(CPU_CORES);
     }
 
@@ -1342,17 +1339,9 @@ orElse()=fallback if empty
 
 ```java
 ResponseEntity.ok(response)              // HTTP 200 — success
-ResponseEntity.
-
-notFound().
-
-build()        // HTTP 404 — not found
-ResponseEntity.
-
-internalServerError()     // HTTP 500 — server error
-    .
-
-body("Error: "+e.getMessage())
+ResponseEntity.notFound().build()        // HTTP 404 — not found
+ResponseEntity.internalServerError()     // HTTP 500 — server error
+    .body("Error: " + e.getMessage())
 ```
 
 **@RequestParam vs @PathVariable:**
@@ -1402,16 +1391,16 @@ public class OrderController {
 
         try {
             CompletableFuture<String> result =
-                    orderService.processOrder(
-                            userId, restaurantId, itemName, quantity, amount);
+                orderService.processOrder(
+                    userId, restaurantId, itemName, quantity, amount);
 
             String response = result.get(); // wait for result
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {
             return ResponseEntity
-                    .internalServerError()
-                    .body("Error: " + e.getMessage());
+                .internalServerError()
+                .body("Error: " + e.getMessage());
         }
     }
 
@@ -1436,7 +1425,7 @@ public class OrderController {
     public ResponseEntity<String> getStatus() {
         long totalOrders = orderRepository.count();
         return ResponseEntity.ok(
-                "SwiggyX running. Total orders: " + totalOrders);
+            "SwiggyX running. Total orders: " + totalOrders);
     }
 }
 ```
@@ -1945,9 +1934,7 @@ Thread names prove work ran on correct pool ✅
 ```java
 public interface OrderRepository extends JpaRepository<Order, Long> {
     List<Order> findByUserId(String userId);      // we wrote this
-
     List<Order> findByRestaurantId(String id);    // we wrote this
-
     List<Order> findByStatus(String status);      // we wrote this
 }
 ```
@@ -1995,3 +1982,250 @@ Fix in Phase 2 Step 3:
 → @Version for optimistic locking
 → Survives restarts, works across servers
 ```
+
+---
+
+### Q10 — What happens when more requests arrive than CPU pool threads?
+
+**The scenario:**
+
+```
+8 CPU threads in cpuThreadPool
+10 simultaneous orders → 10 calls to checkFraud()
+```
+
+**Answer — Fixed thread pool has an internal queue:**
+
+```java
+Executors.newFixedThreadPool(CPU_CORES); // 8 threads
+```
+
+```
+Request 1-8  → immediately get a thread → start running
+Request 9    → no thread free → goes into INTERNAL QUEUE → waits
+Request 10   → no thread free → goes into INTERNAL QUEUE → waits
+
+When Thread 1 finishes (e.g. USER_3's fraud check) →
+→ becomes free → picks up Request 9 from queue → starts running
+```
+
+This is exactly Concept 4 — Thread Pool — in action:
+
+```
+Thread Pool
+┌─────────────────────────────────┐
+│  Thread 1 ── RUNNING            │
+│  ...                            │
+│  Thread 8 ── RUNNING            │
+│  Task Queue: [Req9, Req10]      │  ← waiting here
+└─────────────────────────────────┘
+```
+
+**What the calling code experiences:**
+
+```java
+CompletableFuture<Boolean> fraudFuture = checkFraud(userId, amount);
+// returns IMMEDIATELY — even if fraud check hasn't STARTED yet
+// (it might just be sitting in cpuThreadPool's internal queue)
+
+boolean isFraud = fraudFuture.get();
+// THIS is where actual waiting happens, only if result isn't ready yet
+```
+
+**Proof from our own 10-order test logs:**
+
+```
+Initial batch — exactly 8 "Fraud check started" lines:
+Fraud check started for: USER_5  on thread: pool-3-thread-2
+Fraud check started for: USER_7  on thread: pool-3-thread-1
+Fraud check started for: USER_10 on thread: pool-3-thread-3
+Fraud check started for: USER_6  on thread: pool-3-thread-4
+Fraud check started for: USER_4  on thread: pool-3-thread-5
+Fraud check started for: USER_9  on thread: pool-3-thread-6
+Fraud check started for: USER_2  on thread: pool-3-thread-7
+Fraud check started for: USER_1  on thread: pool-3-thread-8
+
+USER_3 and USER_8 MISSING from initial batch — queued!
+
+Later in same logs:
+Fraud check started for: USER_3 on thread: pool-3-thread-2  ← reused thread
+Fraud check started for: USER_8 on thread: pool-3-thread-4  ← reused thread
+
+These started ONLY after threads 2 and 4 finished their first job.
+This is the internal queue — proven with our own test data.
+```
+
+**Production consideration — unbounded queue risk:**
+
+```java
+// Default newFixedThreadPool — UNBOUNDED queue
+// can grow infinitely if requests arrive faster than processing
+// risk: memory grows unbounded at extreme scale
+
+// Production fix — bounded queue with rejection policy
+new ThreadPoolExecutor(
+    8, 8,                          // core and max threads
+    0L, TimeUnit.MILLISECONDS,
+    new LinkedBlockingQueue<>(100) // max 100 waiting tasks
+);
+// if queue full AND all threads busy → reject task (with a policy)
+```
+
+> **Key insight: A fixed thread pool always comes with an internal queue. Extra tasks beyond the thread count don't
+fail — they wait in queue until a thread frees up. checkFraud() returning a CompletableFuture immediately does NOT mean
+the work started immediately — it might just be queued.**
+
+
+---
+
+### Q11 — Where do we GENUINELY wait in our code? (.get() deep dive)
+
+**The exact line in OrderService.java:**
+
+```java
+// Step 4 — Get fraud result (fraud ran in parallel with inventory check)
+try {
+    boolean isFraud = fraudFuture.get();  // ← GENUINE WAIT HAPPENS HERE
+    if (isFraud) {
+        // restore inventory, return FAILED
+    }
+} catch (Exception e) {
+    return "FAILED: Fraud check error";
+}
+```
+
+**This is the ONLY place in our entire processOrder() flow where the calling thread can genuinely block and wait.**
+
+---
+
+**Why is THIS line special — walking through every possibility:**
+
+```
+Possibility 1 — Fraud check already finished by the time we reach .get()
+─────────────────────────────────────────────────────────────────────
+Timeline:
+0ms   → checkFraud() called → returns CompletableFuture immediately
+0ms   → checkAndDeductInventory() runs → takes ~1ms
+1ms   → (other minor work)
+200ms → fraud check (running in background) FINISHES
+201ms → we reach fraudFuture.get()
+        → result is ALREADY there
+        → .get() returns INSTANTLY, no waiting
+        → thread continues immediately
+
+Possibility 2 — Fraud check still running when we reach .get()
+─────────────────────────────────────────────────────────────────────
+Timeline:
+0ms   → checkFraud() called → returns CompletableFuture immediately
+0ms   → checkAndDeductInventory() runs → takes ~1ms
+1ms   → we reach fraudFuture.get() ALREADY (inventory check was very fast)
+        → fraud check is STILL RUNNING (needs 200ms total, only 1ms passed)
+        → .get() BLOCKS this thread — genuinely waits
+        → thread sits here doing nothing until fraud check finishes
+        → at 200ms, fraud check completes → .get() unblocks → returns isFraud value
+
+Possibility 3 — Fraud check still QUEUED (Q10 scenario — CPU pool full)
+─────────────────────────────────────────────────────────────────────
+Timeline:
+0ms   → checkFraud() called → task goes into cpuThreadPool's QUEUE
+        → (all 8 CPU threads already busy with other orders)
+        → returns CompletableFuture immediately — but fraud check HASN'T STARTED
+0ms   → checkAndDeductInventory() runs → takes ~1ms
+1ms   → we reach fraudFuture.get()
+        → fraud check hasn't even STARTED yet (still in queue)
+        → .get() BLOCKS — waits for:
+          1. a CPU thread to become free
+          2. THEN the fraud logic to run (200ms)
+        → could wait LONGER than 200ms if queue was backed up
+```
+
+---
+
+**Which thread is actually blocked during this wait?**
+
+```
+Remember: processOrder() itself runs on ioThreadPool
+(CompletableFuture.supplyAsync(..., ioThreadPool))
+
+So the thread sitting at fraudFuture.get() is an IO POOL thread
+— NOT the CPU pool thread doing the actual fraud calculation
+
+This means:
+→ One of our 16 ioThreadPool threads is now BLOCKED, waiting
+→ That thread cannot pick up any OTHER order while waiting here
+→ This is exactly the IO thread pool equivalent of the
+  "thread waiting wastes resources" problem from Concept 11
+
+We accepted this tradeoff because:
+→ We NEED the fraud result before deciding to save the order
+→ The order literally cannot proceed without knowing isFraud
+→ This is unavoidable — SOME thread must wait for SOME amount of time
+```
+
+---
+
+**Why we still call this "good" design despite the wait:**
+
+```
+Compare to NOT running fraud check in background at all:
+
+BAD design (sequential, no parallelism):
+0ms   → checkAndDeductInventory() → 1ms
+1ms   → checkFraud() starts AND BLOCKS until done → 201ms
+Total wait: 201ms
+
+OUR design (fraud started early, runs in background):
+0ms   → checkFraud() starts in background (doesn't block)
+0ms   → checkAndDeductInventory() → 1ms (runs WHILE fraud check happens)
+1ms   → fraudFuture.get() → waits for REMAINING 199ms (not full 200ms)
+Total wait: 200ms
+
+We saved 1ms by overlapping the two operations.
+The GENUINE wait at .get() is unavoidable —
+but we minimized HOW LONG we wait by starting fraud check earlier.
+```
+
+---
+
+**The general rule about CompletableFuture.get():**
+
+```
+.get() is a BLOCKING call.
+It ALWAYS waits until the CompletableFuture has a result —
+whether that result:
+→ is already available (returns instantly)
+→ is still being computed (waits for computation to finish)
+→ hasn't even started yet — still queued (waits for queue + computation)
+
+The thread calling .get() is PAUSED for however long is needed.
+This is the single point in async code where "async" temporarily
+becomes "sync" again — you're explicitly asking to wait for the value.
+```
+
+---
+
+**Why don't we avoid .get() entirely then?**
+
+```
+Because at SOME point, we genuinely need the answer to proceed.
+"Is this fraud or not?" determines whether we save the order at all.
+
+The alternative would be fully async chaining:
+checkFraud(userId, amount)
+    .thenCompose(isFraud -> {
+        if (isFraud) return CompletableFuture.completedFuture("FAILED");
+        return checkAndDeductInventory(...)
+            .thenCompose(...)
+    });
+
+This avoids blocking entirely — but makes the code much harder
+to read (the "callback hell" problem from Concept 12).
+We chose .get() for clarity at the cost of one controlled blocking point.
+```
+
+---
+
+> **Key insight: `fraudFuture.get()` is the ONE genuine blocking point in our entire order flow. Everything before it (
+checkFraud starting, inventory check) is non-blocking and runs in parallel. At .get(), an IO pool thread pauses —
+waiting anywhere from 0ms (if fraud already finished) to 200ms+ (if fraud check was queued behind other CPU work) —
+until the fraud result is actually available.**
