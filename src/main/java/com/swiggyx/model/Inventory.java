@@ -1,9 +1,6 @@
 package com.swiggyx.model;
 
-import jakarta.persistence.Column;
-import jakarta.persistence.EmbeddedId;
-import jakarta.persistence.Entity;
-import jakarta.persistence.Table;
+import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -23,4 +20,7 @@ public class Inventory {
     @Column(nullable = false)
     private Integer count;
 
-}
+    @Version
+    private Long version;
+
+}O
