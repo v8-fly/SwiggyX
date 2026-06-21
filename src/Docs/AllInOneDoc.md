@@ -444,6 +444,139 @@ includes a memory barrier).
 
 ---
 
+## Pillar 9.5 — Resolving the Common Confusion: Race Condition vs Memory Visibility, Traced Side by Side
+
+> This confusion is so common that it deserves a dedicated,
+> careful walkthrough — tracing BOTH problems through the SAME
+> example, completely separately, to make the distinction
+> impossible to miss.
+
+### Setting Up ONE Shared Example for Both
+
+```
+Shared variable: inventoryCount = 10
+Operation: inventoryCount = inventoryCount - 1
+```
+
+### Problem 1 — Race Condition, Traced Precisely
+
+```
+This problem is about an OPERATION being split into MULTIPLE
+steps, and those steps getting INTERLEAVED between two threads.
+
+It has NOTHING to do with caching. Even on a hypothetical
+computer with NO CPU cache at all (reading/writing DIRECTLY to
+RAM every time) — this problem would STILL happen.
+
+Why? Because "inventoryCount - 1" is not ONE atomic action —
+it's THREE separate actions: READ the value, CALCULATE the new
+value, WRITE the new value back. The OS can PAUSE a thread
+BETWEEN these three steps and let ANOTHER thread run.
+```
+
+```
+Trace (assume NO caching exists, direct RAM access only):
+
+Thread A: READS inventoryCount from RAM → gets 10
+          [OS interrupts Thread A right here]
+Thread B: READS inventoryCount from RAM → ALSO gets 10
+          (memory still says 10, Thread A hasn't written yet)
+Thread B: CALCULATES 10 - 1 = 9
+Thread B: WRITES 9 back to RAM
+          [OS resumes Thread A]
+Thread A: CALCULATES 10 - 1 = 9  (using its OWN earlier-read
+          value of 10 — has NO IDEA Thread B already changed
+          RAM to 9)
+Thread A: WRITES 9 back to RAM
+
+Final RAM value: 9 (WRONG — should be 8, one deduction was lost)
+```
+
+```
+THE CAUSE: an operation that should be ONE atomic step was
+actually THREE separate, INTERRUPTIBLE steps.
+
+THE FIX: make those 3 steps happen as ONE indivisible unit —
+exactly what locks (ReentrantLock, synchronized) do. They don't
+care AT ALL about caching — they care about PREVENTING
+interruption/interleaving of the 3 steps.
+```
+
+### Problem 2 — Memory Visibility, Traced Precisely (a COMPLETELY Different Scenario)
+
+```
+To ISOLATE this problem from Problem 1 entirely, use a DIFFERENT
+scenario — one where there is ONLY ONE WRITE happening (no race
+between two writers at all).
+
+Thread A is the ONLY thread that EVER writes to a variable called
+isRestaurantOpen. Thread B only READS it, never writes it. There
+is NO "two writers racing" situation here at all.
+```
+
+```
+isRestaurantOpen = true   (initial value)
+
+Thread A (running on CPU Core 1):
+sets isRestaurantOpen = false
+→ this write FIRST lands in Core 1's LOCAL CACHE
+→ it has NOT yet been "flushed" all the way back to main RAM
+
+Thread B (running on CPU Core 2, with its OWN SEPARATE cache):
+reads isRestaurantOpen
+→ Core 2's cache STILL has the OLD cached copy: true
+→ Thread B has NO IDEA Thread A already changed it
+→ Thread B incorrectly believes the restaurant is STILL open
+```
+
+```
+THE CAUSE: this has NOTHING to do with multiple steps or
+interleaving. There's only ONE write happening, by ONE thread,
+in a perfectly simple, non-interrupted way. The PROBLEM is
+PURELY about HOW LONG it takes for a WRITTEN value to become
+VISIBLE to a DIFFERENT CPU core's cache.
+
+THE FIX: volatile forces every read/write of that variable to
+go DIRECTLY to main RAM, bypassing each core's local cache
+entirely — guaranteeing instant visibility across all threads/cores.
+```
+
+### The Cleanest Side-by-Side Distinction
+
+```
+                    Race Condition          Memory Visibility
+─────────────────── ─────────────────────── ───────────────────────
+How many writers?    TWO OR MORE threads     Can happen with even
+                     writing                 just ONE writer
+What's the core      An operation made of    A WRITTEN value taking
+problem?             MULTIPLE steps gets     time to become VISIBLE
+                     INTERRUPTED midway      to OTHER cores/threads
+Is caching involved? NO — happens even       YES — entirely about
+                     with zero caching       cache-to-RAM propagation
+                     at all                  delay
+What's the fix?      Locks (force the 3      volatile (force direct
+                     steps to be atomic,    RAM read/write, skip
+                     uninterruptible)        local cache entirely)
+```
+
+### The Trap to Specifically Avoid
+
+```
+The TRAP is thinking "CPU cache" is somehow THE CAUSE of race
+conditions. It is NOT. Race conditions are about INTERRUPTED
+MULTI-STEP OPERATIONS — they would exist EVEN ON a hypothetical
+computer with NO CPU cache whatsoever.
+
+Memory visibility is a SEPARATE, ADDITIONAL problem that exists
+SPECIFICALLY because of HOW modern CPUs use local caches for speed.
+```
+
+### One Line Summary
+
+> **A race condition happens because a single logical operation (like "subtract 1") is actually MULTIPLE separate steps that can be INTERRUPTED and INTERLEAVED between threads — this would happen even on a computer with zero CPU caching. Memory visibility is a SEPARATE problem where a value IS written correctly and atomically by one thread, but TAKES TIME to propagate from that CPU core's local cache to other cores, causing other threads to see a STALE value temporarily — this is specifically a caching artifact, unrelated to multi-step interruption.**
+
+---
+
 ## Pillar 10 — synchronized vs ReentrantLock (Correcting an Earlier Mix-Up)
 
 ```
@@ -1021,6 +1154,9 @@ retries under heavy contention become wasteful themselves.
 8. Race Conditions          → LOAD-MODIFY-STORE non-atomicity
 9. Memory Visibility        → CPU cache staleness (DIFFERENT
                                problem from race conditions!)
+9.5. Race vs Visibility      → side-by-side traced comparison —
+     (Common Confusion)         race = interrupted multi-step op,
+                                 visibility = cache propagation delay
 10. Mutex/Lock vs Fair Lock → fairness guarantee prevents starvation
 11. CPU-bound vs IO-bound    → thread count rule: more is fine for
     thread sizing             IO, = cores exactly for CPU work
