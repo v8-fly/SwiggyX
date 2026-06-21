@@ -23,4 +23,4 @@ public class Inventory {
     @Version
     private Long version;
 
-}O
+}
