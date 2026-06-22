@@ -7,13 +7,16 @@ import com.swiggyx.repository.InventoryRepository;
 import com.swiggyx.repository.OrderRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.locks.ReentrantLock;
+
 
 @Service
 public class OrderService {
@@ -101,33 +104,43 @@ public class OrderService {
                                             String restaurantId,
                                             String itemName,
                                             int quantity) {
-        inventoryLock.lock();
-        try {
-            InventoryId invId = new InventoryId(restaurantId, itemName);
 
-            Inventory inv = inventoryRepository.findById(invId)
-                    .orElseThrow(() -> new RuntimeException(
-                            "Inventory not found for: " + restaurantId + ", " + itemName));
+        int maxRetries = 3;
 
-            System.out.println("Inventory check for: " + userId
-                    + " | Current: " + inv.getCount()
-                    + " | Thread: " + Thread.currentThread().getName());
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                InventoryId invId = new InventoryId(restaurantId, itemName);
 
-            if (inv.getCount() < quantity) {
-                System.out.println("Insufficient inventory for: " + userId);
-                return false;
+                Inventory inv = inventoryRepository.findById(invId)
+                        .orElseThrow(() -> new RuntimeException(
+                                "Inventory not found for: " + restaurantId + ", " + itemName));
+
+                System.out.println("Inventory check for: " + userId
+                        + " | Current: " + inv.getCount()
+                        + " | Version: " + inv.getVersion()
+                        + " | Attempt: " + attempt
+                        + " | Thread: " + Thread.currentThread().getName());
+
+                if (inv.getCount() < quantity) {
+                    System.out.println("Insufficient inventory for: " + userId);
+                    return false;  // genuinely sold out
+                }
+
+                inv.setCount(inv.getCount() - quantity);
+                inventoryRepository.save(inv);
+
+                System.out.println("Inventory deducted for: " + userId
+                        + " | Remaining: " + inv.getCount());
+                return true;
+
+            } catch (OptimisticLockingFailureException e) {
+                System.out.println("Conflict detected for: " + userId
+                        + " | Attempt: " + attempt + " | Retrying...");
             }
-
-            inv.setCount(inv.getCount() - quantity);
-            inventoryRepository.save(inv);
-
-            System.out.println("Inventory deducted for: " + userId
-                    + " | Remaining: " + inv.getCount());
-            return true;
-
-        } finally {
-            inventoryLock.unlock();
         }
+
+        System.out.println("Failed after " + maxRetries + " attempts for: " + userId);
+        throw new RuntimeException("HIGH_DEMAND");  // ← NEW: distinct signal
     }
 
     // Step 4 — Save Order to DB
@@ -137,6 +150,7 @@ public class OrderService {
                                 String itemName,
                                 int quantity,
                                 double amount) {
+
 
         System.out.println("Saving order to DB for: " + userId
                 + " | Thread: " + Thread.currentThread().getName());
@@ -152,14 +166,32 @@ public class OrderService {
                 .build();
 
         Order savedOrder = orderRepository.save(order);
-        System.out.println("Order saved: " + savedOrder.getId()
-                + " for: " + userId);
-
+        System.out.println("Order saved: " + savedOrder.getId() + " for: " + userId);
         return savedOrder;
     }
 
-    // Main method — connects all steps together
-    // This is what Controller will call
+    private void restoreInventory(String restaurantId, String itemName, int quantity, String userId) {
+        int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                InventoryId invId = new InventoryId(restaurantId, itemName);
+                Inventory inv = inventoryRepository.findById(invId)
+                        .orElseThrow(() -> new RuntimeException("Inventory not found"));
+
+                inv.setCount(inv.getCount() + quantity);
+                inventoryRepository.save(inv);
+
+                System.out.println("Inventory restored for: " + userId);
+                return;
+
+            } catch (OptimisticLockingFailureException e) {
+                System.out.println("Conflict while restoring for: " + userId + " | Retrying...");
+            }
+        }
+        System.out.println("WARNING: Failed to restore inventory for: " + userId);
+    }
+
+    // UNCHANGED — this is our outer method, runs on ioThreadPool
     public CompletableFuture<String> processOrder(String userId,
                                                   String restaurantId,
                                                   String itemName,
@@ -171,60 +203,46 @@ public class OrderService {
             System.out.println("Order started for: " + userId
                     + " | Thread: " + Thread.currentThread().getName());
 
-            // Step 1 — Validate
             if (!validateOrder(userId, itemName, quantity, amount)) {
                 return "FAILED: Invalid order details";
             }
 
-            // Step 2 — Fraud detection (runs on CPU pool in background)
-            CompletableFuture<Boolean> fraudFuture =
-                    checkFraud(userId, amount);
+            CompletableFuture<Boolean> fraudFuture = checkFraud(userId, amount);
 
-            // Step 3 — Check and deduct inventory
-            // Lock ordering: inventoryLock acquired here (FIRST)
-            boolean inventoryAvailable =
-                    checkAndDeductInventory(userId, restaurantId, itemName, quantity);
-
-            if (!inventoryAvailable) {
-                return "FAILED: Item not available";
+            // NEW — calls our @Transactional method, runs on THIS
+            // SAME ioThreadPool thread (no further async hop happens)
+            Order savedOrder;
+            try {
+                savedOrder = processOrderTransactionally(userId, restaurantId, itemName, quantity, amount);
+            } catch (RuntimeException e) {
+                if ("HIGH_DEMAND".equals(e.getMessage())) {
+                    return "FAILED: High demand right now, please try again";
+                }
+                if ("INSUFFICIENT_INVENTORY".equals(e.getMessage())) {
+                    return "FAILED: Item not available";
+                }
+                return "FAILED: Order processing error";
             }
 
             // Step 4 — Wait for fraud result
-            // By now fraud check has been running in background
-            // hopefully already done or almost done
             try {
                 boolean isFraud = fraudFuture.get();
                 if (isFraud) {
-                    inventoryLock.lock();
-                    try {
-                        InventoryId invId = new InventoryId(restaurantId, itemName);
-                        Inventory inv = inventoryRepository.findById(invId)
-                                .orElseThrow(() -> new RuntimeException("Inventory not found"));
-
-                        inv.setCount(inv.getCount() + quantity);
-                        inventoryRepository.save(inv);
-
-                        System.out.println("Inventory restored — fraud: " + userId);
-                    } finally {
-                        inventoryLock.unlock();
-                    }
+                    restoreInventory(restaurantId, itemName, quantity, userId);
+                    // also need to undo the order we just saved!
+                    orderRepository.delete(savedOrder);
                     return "FAILED: Fraud detected";
                 }
             } catch (Exception e) {
+                restoreInventory(restaurantId, itemName, quantity, userId);
+                orderRepository.delete(savedOrder);
                 return "FAILED: Fraud check error";
             }
 
-            // Step 5 — Save to DB (Semaphore controls access)
-            Order savedOrder = saveOrderToDB(userId, restaurantId,
-                    itemName, quantity, amount);
-
             // Step 6 — Charge payment
-            // Lock ordering: paymentLock acquired here (SECOND)
             paymentLock.lock();
             try {
-                System.out.println("Payment processing for: " + userId
-                        + " | Amount: " + amount);
-                // Simulate payment gateway call
+                System.out.println("Payment processing for: " + userId + " | Amount: " + amount);
                 Thread.sleep(30);
                 System.out.println("Payment done for: " + userId);
             } catch (InterruptedException e) {
@@ -233,15 +251,35 @@ public class OrderService {
                 paymentLock.unlock();
             }
 
-            // Step 7 — Notify (fire and forget — user doesn't wait)
+            // Step 7 — Notify
             CompletableFuture.runAsync(() -> {
-                System.out.println("Notification sent for order: "
-                        + savedOrder.getId());
+                System.out.println("Notification sent for order: " + savedOrder.getId());
             }, ioThreadPool);
 
             return "SUCCESS: Order placed. ID: " + savedOrder.getId();
 
-        }, ioThreadPool); // entire flow runs on IO thread pool
+        }, ioThreadPool);
+    }
+
+    // NEW — the actual @Transactional method
+// Inventory deduction AND order save now happen ATOMICALLY
+    @Transactional
+    public Order processOrderTransactionally(String userId,
+                                             String restaurantId,
+                                             String itemName,
+                                             int quantity,
+                                             double amount) {
+
+        boolean inventoryAvailable = checkAndDeductInventory(userId, restaurantId, itemName, quantity);
+        if (!inventoryAvailable) {
+            throw new RuntimeException("INSUFFICIENT_INVENTORY");
+        }
+
+        if (true) {
+            throw new RuntimeException("SIMULATED FAILURE AFTER INVENTORY DEDUCTED");
+        }  // ← TEMPORARY
+
+        return saveOrderToDB(userId, restaurantId, itemName, quantity, amount);
     }
 
 }
